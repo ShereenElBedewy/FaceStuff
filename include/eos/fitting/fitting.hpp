@@ -140,7 +140,7 @@ inline cv::Mat fit_shape(cv::Mat affine_camera_matrix, morphablemodel::Morphable
  * @param[in] landmarks A LandmarkCollection of 2D landmarks.
  * @param[in] landmark_mapper A mapper which maps the 2D landmark identifiers to 3D model vertex indices.
  * @param[in] morphable_model Model to get the 3D point coordinates from.
- * @return A tuple of [image_points, model_points, vertex_indices].
+ * @return A tuple of [image_points, current_model_points, vertex_indices].
  */
 template<class T>
 inline auto get_corresponding_pointset(const T& landmarks, const core::LandmarkMapper& landmark_mapper, const morphablemodel::MorphableModel& morphable_model)
@@ -151,7 +151,7 @@ inline auto get_corresponding_pointset(const T& landmarks, const core::LandmarkM
 	using cv::Vec4f;
 
 	// These will be the final 2D and 3D points used for the fitting:
-	vector<Vec4f> model_points; // the points in the 3D shape model
+    vector<Vec4f> current_model_points; // the points in the 3D shape model
 	vector<int> vertex_indices; // their vertex indices
 	vector<Vec2f> image_points; // the corresponding 2D landmark points
 
@@ -163,11 +163,11 @@ inline auto get_corresponding_pointset(const T& landmarks, const core::LandmarkM
 		}
 		int vertex_idx = std::stoi(converted_name.get());
 		Vec4f vertex = morphable_model.get_shape_model().get_mean_at_point(vertex_idx);
-		model_points.emplace_back(vertex);
+        current_model_points.emplace_back(vertex);
 		vertex_indices.emplace_back(vertex_idx);
 		image_points.emplace_back(landmarks[i].coordinates);
 	}
-	return std::make_tuple(image_points, model_points, vertex_indices);
+    return std::make_tuple(image_points, current_model_points, vertex_indices);
 };
 
 /**
@@ -231,138 +231,197 @@ inline auto concat(const std::vector<T>& vec_a, const std::vector<T>& vec_b)
  * @param[out] fitted_image_points Debug parameter: Returns all the 2D points that have been used for the fitting.
  * @return The fitted model shape instance and the final pose.
  */
+inline std::pair<std::vector<core::Mesh>, std::vector<fitting::RenderingParameters>> fit_shape_and_pose_multi(const morphablemodel::MorphableModel& morphable_model, const std::vector<morphablemodel::Blendshape>& blendshapes, const std::vector<core::LandmarkCollection<cv::Vec2f>>& landmarks, const core::LandmarkMapper& landmark_mapper, std::vector<int> image_width, std::vector<int> image_height, const morphablemodel::EdgeTopology& edge_topology, const fitting::ContourLandmarks& contour_landmarks, const fitting::ModelContour& model_contour, int num_iterations, boost::optional<int> num_shape_coefficients_to_fit, float lambda, boost::optional<fitting::RenderingParameters> initial_rendering_params, std::vector<float>& pca_shape_coefficients, std::vector<std::vector<float>>& blendshape_coefficients, std::vector<std::vector<cv::Vec2f>>& fitted_image_points)
+{
+    assert(blendshapes.size() > 0);
+    assert(landmarks.size() > 0 && landmarks.size() == image_width.size() && image_width.size() == image_height.size());
+    assert(num_iterations > 0); // Can we allow 0, for only the initial pose-fit?
+    assert(pca_shape_coefficients.size() <= morphable_model.get_shape_model().get_num_principal_components());
+    int num_images = static_cast<int>(landmarks.size());
+
+    for (int j = 0; j < num_images; ++j) {
+        assert(landmarks[j].size() >= 4);
+        assert(image_width[j] > 0 && image_height[j] > 0);
+    }
+    // More asserts I forgot?
+
+    using std::vector;
+    using cv::Vec2f;
+    using cv::Vec4f;
+    using cv::Mat;
+
+
+
+    if (!num_shape_coefficients_to_fit)
+    {
+        num_shape_coefficients_to_fit = morphable_model.get_shape_model().get_num_principal_components();
+    }
+
+    if (pca_shape_coefficients.empty())
+    {
+        pca_shape_coefficients.resize(num_shape_coefficients_to_fit.get());
+    }
+    // Todo: This leaves the following case open: num_coeffs given is empty or defined, but the
+    // pca_shape_coefficients given is != num_coeffs or the model's max-coeffs. What to do then? Handle & document!
+
+    if (blendshape_coefficients.size() == 0)
+    {
+        for (int j = 0; j < num_images; ++j) {
+            std::vector<float> current_blendshape_coefficients;
+            current_blendshape_coefficients.resize(blendshapes.size());
+            blendshape_coefficients.push_back(current_blendshape_coefficients);
+        }
+    }
+
+    Mat blendshapes_as_basis = morphablemodel::to_matrix(blendshapes);
+
+    // Current mesh - either from the given coefficients, or the mean:
+    Mat current_pca_shape = morphable_model.get_shape_model().draw_sample(pca_shape_coefficients);
+    vector<Mat> current_combined_shapes;
+    vector<eos::core::Mesh> current_meshs;
+    for (int j = 0; j < num_images; ++j) {
+        Mat current_combined_shape = current_pca_shape + blendshapes_as_basis * Mat(blendshape_coefficients[j]);
+        current_combined_shapes.push_back(current_combined_shape);
+
+        eos::core::Mesh current_mesh = morphablemodel::sample_to_mesh(current_combined_shape, morphable_model.get_color_model().get_mean(), morphable_model.get_shape_model().get_triangle_list(), morphable_model.get_color_model().get_triangle_list(), morphable_model.get_texture_coordinates());
+        current_meshs.push_back(current_mesh);
+    }
+
+    // The 2D and 3D point correspondences used for the fitting:
+    vector<vector<Vec4f>> model_points; // the points in the 3D shape model of all frames
+    vector<vector<int>> vertex_indices; // their vertex indices of all frames
+    vector<vector<Vec2f>> image_points; // the corresponding 2D landmark points of all frames
+
+    // Sub-select all the landmarks which we have a mapping for (i.e. that are defined in the 3DMM),
+    // and get the corresponding model points (mean if given no initial coeffs, from the computed shape otherwise):
+    for (int j = 0; j < num_images; ++j) {
+        vector<Vec4f> current_model_points;
+        vector<int> current_vertex_indices;
+        vector<Vec2f> current_image_points;
+
+        for (int i = 0; i < landmarks[j].size(); ++i) {
+            auto converted_name = landmark_mapper.convert(landmarks[j][i].name);
+            if (!converted_name) { // no mapping defined for the current landmark
+                continue;
+            }
+            int vertex_idx = std::stoi(converted_name.get());
+            Vec4f vertex(current_meshs[j].vertices[vertex_idx].x, current_meshs[j].vertices[vertex_idx].y, current_meshs[j].vertices[vertex_idx].z, current_meshs[j].vertices[vertex_idx].w);
+            current_model_points.emplace_back(vertex);
+            current_vertex_indices.emplace_back(vertex_idx);
+            current_image_points.emplace_back(landmarks[j][i].coordinates);
+        }
+
+        model_points.push_back(current_model_points);
+        vertex_indices.push_back(current_vertex_indices);
+        image_points.push_back(current_image_points);
+    }
+
+
+    // Need to do an initial pose fit to do the contour fitting inside the loop.
+    // We'll do an expression fit too, since face shapes vary quite a lot, depending on expressions.
+    vector<fitting::RenderingParameters> rendering_params;
+    for (int j = 0; j < num_images; ++j) {
+        fitting::ScaledOrthoProjectionParameters current_pose = fitting::estimate_orthographic_projection_linear(image_points[j], model_points[j], true, image_height[j]);
+        fitting::RenderingParameters current_rendering_params(current_pose, image_width[j], image_height[j]);
+        rendering_params.push_back(current_rendering_params);
+
+        Mat affine_from_ortho = fitting::get_3x4_affine_camera_matrix(current_rendering_params, image_width[j], image_height[j]);
+        blendshape_coefficients[j] = fitting::fit_blendshapes_to_landmarks_nnls(blendshapes, current_pca_shape, affine_from_ortho, image_points[j], vertex_indices[j]);
+
+        // Mesh with same PCA coeffs as before, but new expression fit (this is relevant if no initial blendshape coeffs have been given):
+        current_combined_shapes[j] = current_pca_shape + morphablemodel::to_matrix(blendshapes) * Mat(blendshape_coefficients[j]);
+        current_meshs[j] = morphablemodel::sample_to_mesh(current_combined_shapes[j], morphable_model.get_color_model().get_mean(), morphable_model.get_shape_model().get_triangle_list(), morphable_model.get_color_model().get_triangle_list(), morphable_model.get_texture_coordinates());
+    }
+
+    // The static (fixed) landmark correspondences which will stay the same throughout
+    // the fitting (the inner face landmarks):
+    vector<vector<int>> fixed_vertex_indices (vertex_indices);
+    vector<vector<Vec2f>> fixed_image_points (image_points);
+
+    for (int i = 0; i < num_iterations; ++i)
+    {
+        std::vector<cv::Mat> affine_from_orthos;
+        std::vector<cv::Mat> mean_plus_blendshapess;
+        //std::vector<std::vector<Vec2f>> image_points_w_contour;
+        //std::vector<std::vector<int>> vertex_indices_w_contour;
+
+        image_points = fixed_image_points;
+        vertex_indices = fixed_vertex_indices;
+
+        for (int j = 0; j < num_images; ++j) {
+            //vertex_indices_w_contour.push_back(vector<int>(fixed_vertex_indices[j]));
+            //image_points_w_contour.push_back(vector<Vec2f>(fixed_image_points[j]));
+
+            // Given the current pose, find 2D-3D contour correspondences of the front-facing face contour:
+            vector<Vec2f> image_points_contour;
+            vector<int> vertex_indices_contour;
+            auto yaw_angle = glm::degrees(glm::eulerAngles(rendering_params[j].get_rotation())[1]);
+            // For each 2D contour landmark, get the corresponding 3D vertex point and vertex id:
+            std::tie(image_points_contour, std::ignore, vertex_indices_contour) = fitting::get_contour_correspondences(landmarks[j], contour_landmarks, model_contour, yaw_angle, current_meshs[j], rendering_params[j].get_modelview(), rendering_params[j].get_projection(), fitting::get_opencv_viewport(image_width[j], image_height[j]));
+            // Add the contour correspondences to the set of landmarks that we use for the fitting:
+            vertex_indices[j] = fitting::concat(vertex_indices[j], vertex_indices_contour);
+            image_points[j] = fitting::concat(image_points[j], image_points_contour);
+
+            // Fit the occluding (away-facing) contour using the detected contour LMs:
+            vector<Eigen::Vector2f> occluding_contour_landmarks;
+            if (yaw_angle >= 0.0f) // positive yaw = subject looking to the left
+            { // the left contour is the occluding one we want to use ("away-facing")
+                auto contour_landmarks_ = core::filter(landmarks[j], contour_landmarks.left_contour); // Can do this outside of the loop
+                std::for_each(begin(contour_landmarks_), end(contour_landmarks_), [&occluding_contour_landmarks](auto&& lm) { occluding_contour_landmarks.push_back({ lm.coordinates[0], lm.coordinates[1] }); });
+            }
+            else {
+                auto contour_landmarks_ = core::filter(landmarks[j], contour_landmarks.right_contour);
+                std::for_each(begin(contour_landmarks_), end(contour_landmarks_), [&occluding_contour_landmarks](auto&& lm) { occluding_contour_landmarks.push_back({ lm.coordinates[0], lm.coordinates[1] }); });
+            }
+            auto edge_correspondences = fitting::find_occluding_edge_correspondences(current_meshs[j], edge_topology, rendering_params[j], occluding_contour_landmarks, 180.0f);
+            image_points[j] = fitting::concat(image_points[j], edge_correspondences.first);
+            vertex_indices[j] = fitting::concat(vertex_indices[j], edge_correspondences.second);
+
+            // Get the model points of the current mesh, for all correspondences that we've got:
+            model_points[j].clear();
+            for (const auto& v : vertex_indices[j])
+            {
+                model_points[j].push_back({ current_meshs[j].vertices[v][0], current_meshs[j].vertices[v][1], current_meshs[j].vertices[v][2], current_meshs[j].vertices[v][3] });
+            }
+
+            // Re-estimate the pose, using all correspondences:
+            fitting::ScaledOrthoProjectionParameters current_pose = fitting::estimate_orthographic_projection_linear(image_points[j], model_points[j], true, image_height[j]);
+            rendering_params[j] = fitting::RenderingParameters(current_pose, image_width[j], image_height[j]);
+
+            Mat affine_from_ortho = fitting::get_3x4_affine_camera_matrix(rendering_params[j], image_width[j], image_height[j]);
+            affine_from_orthos.push_back(affine_from_ortho);
+
+            // Estimate the PCA shape coefficients with the current blendshape coefficients:
+            Mat mean_plus_blendshapes = morphable_model.get_shape_model().get_mean() + blendshapes_as_basis * Mat(blendshape_coefficients[j]);
+            mean_plus_blendshapess.push_back(mean_plus_blendshapes);
+        }
+        pca_shape_coefficients = fitting::fit_shape_to_landmarks_linear_multi(morphable_model, affine_from_orthos, image_points, vertex_indices, mean_plus_blendshapess, lambda, num_shape_coefficients_to_fit);
+
+        // Estimate the blendshape coefficients with the current PCA model estimate:
+        current_pca_shape = morphable_model.get_shape_model().draw_sample(pca_shape_coefficients);
+
+        for (int j = 0; j < num_images; ++j) {
+            blendshape_coefficients[j] = fitting::fit_blendshapes_to_landmarks_nnls(blendshapes, current_pca_shape, affine_from_orthos[j], image_points[j], vertex_indices[j]);
+
+            current_combined_shapes[j] = current_pca_shape + blendshapes_as_basis * Mat(blendshape_coefficients[j]);
+            current_meshs[j] = morphablemodel::sample_to_mesh(current_combined_shapes[j], morphable_model.get_color_model().get_mean(), morphable_model.get_shape_model().get_triangle_list(), morphable_model.get_color_model().get_triangle_list(), morphable_model.get_texture_coordinates());
+        }
+    }
+
+    //fitted_image_points = image_points;
+    return { current_meshs, rendering_params }; // I think we could also work with a Mat face_instance in this function instead of a Mesh, but it would convolute the code more (i.e. more complicated to access vertices).
+};
+
+// philipp helper, todo: is the blendshape coefficient thing really solved correctly here?
 inline std::pair<core::Mesh, fitting::RenderingParameters> fit_shape_and_pose(const morphablemodel::MorphableModel& morphable_model, const std::vector<morphablemodel::Blendshape>& blendshapes, const core::LandmarkCollection<cv::Vec2f>& landmarks, const core::LandmarkMapper& landmark_mapper, int image_width, int image_height, const morphablemodel::EdgeTopology& edge_topology, const fitting::ContourLandmarks& contour_landmarks, const fitting::ModelContour& model_contour, int num_iterations, boost::optional<int> num_shape_coefficients_to_fit, float lambda, boost::optional<fitting::RenderingParameters> initial_rendering_params, std::vector<float>& pca_shape_coefficients, std::vector<float>& blendshape_coefficients, std::vector<cv::Vec2f>& fitted_image_points)
 {
-	assert(blendshapes.size() > 0);
-	assert(landmarks.size() >= 4);
-	assert(image_width > 0 && image_height > 0);
-	assert(num_iterations > 0); // Can we allow 0, for only the initial pose-fit?
-	assert(pca_shape_coefficients.size() <= morphable_model.get_shape_model().get_num_principal_components());
-	// More asserts I forgot?
-
-	using std::vector;
-	using cv::Vec2f;
-	using cv::Vec4f;
-	using cv::Mat;
-
-	if (!num_shape_coefficients_to_fit)
-	{
-		num_shape_coefficients_to_fit = morphable_model.get_shape_model().get_num_principal_components();
-	}
-
-	if (pca_shape_coefficients.empty())
-	{
-		pca_shape_coefficients.resize(num_shape_coefficients_to_fit.get());
-	}
-	// Todo: This leaves the following case open: num_coeffs given is empty or defined, but the
-	// pca_shape_coefficients given is != num_coeffs or the model's max-coeffs. What to do then? Handle & document!
-
-	if (blendshape_coefficients.empty())
-	{
-		blendshape_coefficients.resize(blendshapes.size());
-	}
-
-	Mat blendshapes_as_basis = morphablemodel::to_matrix(blendshapes);
-
-	// Current mesh - either from the given coefficients, or the mean:
-	Mat current_pca_shape = morphable_model.get_shape_model().draw_sample(pca_shape_coefficients);
-	Mat current_combined_shape = current_pca_shape + blendshapes_as_basis * Mat(blendshape_coefficients);
-	auto current_mesh = morphablemodel::sample_to_mesh(current_combined_shape, morphable_model.get_color_model().get_mean(), morphable_model.get_shape_model().get_triangle_list(), morphable_model.get_color_model().get_triangle_list(), morphable_model.get_texture_coordinates());
-
-	// The 2D and 3D point correspondences used for the fitting:
-	vector<Vec4f> model_points; // the points in the 3D shape model
-	vector<int> vertex_indices; // their vertex indices
-	vector<Vec2f> image_points; // the corresponding 2D landmark points
-
-	// Sub-select all the landmarks which we have a mapping for (i.e. that are defined in the 3DMM),
-	// and get the corresponding model points (mean if given no initial coeffs, from the computed shape otherwise):
-	for (int i = 0; i < landmarks.size(); ++i) {
-		auto converted_name = landmark_mapper.convert(landmarks[i].name);
-		if (!converted_name) { // no mapping defined for the current landmark
-			continue;
-		}
-		int vertex_idx = std::stoi(converted_name.get());
-		Vec4f vertex(current_mesh.vertices[vertex_idx].x, current_mesh.vertices[vertex_idx].y, current_mesh.vertices[vertex_idx].z, current_mesh.vertices[vertex_idx].w);
-		model_points.emplace_back(vertex);
-		vertex_indices.emplace_back(vertex_idx);
-		image_points.emplace_back(landmarks[i].coordinates);
-	}
-
-	// Need to do an initial pose fit to do the contour fitting inside the loop.
-	// We'll do an expression fit too, since face shapes vary quite a lot, depending on expressions.
-	fitting::ScaledOrthoProjectionParameters current_pose;
-	current_pose = fitting::estimate_orthographic_projection_linear(image_points, model_points, true, image_height);
-	fitting::RenderingParameters rendering_params(current_pose, image_width, image_height);
-
-	Mat affine_from_ortho = fitting::get_3x4_affine_camera_matrix(rendering_params, image_width, image_height);
-	blendshape_coefficients = fitting::fit_blendshapes_to_landmarks_nnls(blendshapes, current_pca_shape, affine_from_ortho, image_points, vertex_indices);
-
-	// Mesh with same PCA coeffs as before, but new expression fit (this is relevant if no initial blendshape coeffs have been given):
-	current_combined_shape = current_pca_shape + morphablemodel::to_matrix(blendshapes) * Mat(blendshape_coefficients);
-	current_mesh = morphablemodel::sample_to_mesh(current_combined_shape, morphable_model.get_color_model().get_mean(), morphable_model.get_shape_model().get_triangle_list(), morphable_model.get_color_model().get_triangle_list(), morphable_model.get_texture_coordinates());
-
-	// The static (fixed) landmark correspondences which will stay the same throughout
-	// the fitting (the inner face landmarks):
-	auto fixed_image_points = image_points;
-	auto fixed_vertex_indices = vertex_indices;
-
-	for (int i = 0; i < num_iterations; ++i)
-	{
-		image_points = fixed_image_points;
-		vertex_indices = fixed_vertex_indices;
-		// Given the current pose, find 2D-3D contour correspondences of the front-facing face contour:
-		vector<Vec2f> image_points_contour;
-		vector<int> vertex_indices_contour;
-		auto yaw_angle = glm::degrees(glm::eulerAngles(rendering_params.get_rotation())[1]);
-		// For each 2D contour landmark, get the corresponding 3D vertex point and vertex id:
-		std::tie(image_points_contour, std::ignore, vertex_indices_contour) = fitting::get_contour_correspondences(landmarks, contour_landmarks, model_contour, yaw_angle, current_mesh, rendering_params.get_modelview(), rendering_params.get_projection(), fitting::get_opencv_viewport(image_width, image_height));
-		// Add the contour correspondences to the set of landmarks that we use for the fitting:
-		vertex_indices = fitting::concat(vertex_indices, vertex_indices_contour);
-		image_points = fitting::concat(image_points, image_points_contour);
-
-		// Fit the occluding (away-facing) contour using the detected contour LMs:
-		vector<Eigen::Vector2f> occluding_contour_landmarks;
-		if (yaw_angle >= 0.0f) // positive yaw = subject looking to the left
-		{ // the left contour is the occluding one we want to use ("away-facing")
-			auto contour_landmarks_ = core::filter(landmarks, contour_landmarks.left_contour); // Can do this outside of the loop
-			std::for_each(begin(contour_landmarks_), end(contour_landmarks_), [&occluding_contour_landmarks](auto&& lm) { occluding_contour_landmarks.push_back({ lm.coordinates[0], lm.coordinates[1] }); });
-		}
-		else {
-			auto contour_landmarks_ = core::filter(landmarks, contour_landmarks.right_contour);
-			std::for_each(begin(contour_landmarks_), end(contour_landmarks_), [&occluding_contour_landmarks](auto&& lm) { occluding_contour_landmarks.push_back({ lm.coordinates[0], lm.coordinates[1] }); });
-		}
-		auto edge_correspondences = fitting::find_occluding_edge_correspondences(current_mesh, edge_topology, rendering_params, occluding_contour_landmarks, 180.0f);
-		image_points = fitting::concat(image_points, edge_correspondences.first);
-		vertex_indices = fitting::concat(vertex_indices, edge_correspondences.second);
-
-		// Get the model points of the current mesh, for all correspondences that we've got:
-		model_points.clear();
-		for (const auto& v : vertex_indices)
-		{
-			model_points.push_back({ current_mesh.vertices[v][0], current_mesh.vertices[v][1], current_mesh.vertices[v][2], current_mesh.vertices[v][3] });
-		}
-
-		// Re-estimate the pose, using all correspondences:
-		current_pose = fitting::estimate_orthographic_projection_linear(image_points, model_points, true, image_height);
-		rendering_params = fitting::RenderingParameters(current_pose, image_width, image_height);
-
-		Mat affine_from_ortho = fitting::get_3x4_affine_camera_matrix(rendering_params, image_width, image_height);
-
-		// Estimate the PCA shape coefficients with the current blendshape coefficients:
-		Mat mean_plus_blendshapes = morphable_model.get_shape_model().get_mean() + blendshapes_as_basis * Mat(blendshape_coefficients);
-		pca_shape_coefficients = fitting::fit_shape_to_landmarks_linear(morphable_model, affine_from_ortho, image_points, vertex_indices, mean_plus_blendshapes, lambda, num_shape_coefficients_to_fit);
-
-		// Estimate the blendshape coefficients with the current PCA model estimate:
-		current_pca_shape = morphable_model.get_shape_model().draw_sample(pca_shape_coefficients);
-		blendshape_coefficients = fitting::fit_blendshapes_to_landmarks_nnls(blendshapes, current_pca_shape, affine_from_ortho, image_points, vertex_indices);
-
-		current_combined_shape = current_pca_shape + blendshapes_as_basis * Mat(blendshape_coefficients);
-		current_mesh = morphablemodel::sample_to_mesh(current_combined_shape, morphable_model.get_color_model().get_mean(), morphable_model.get_shape_model().get_triangle_list(), morphable_model.get_color_model().get_triangle_list(), morphable_model.get_texture_coordinates());
-	}
-
-	fitted_image_points = image_points;
-	return { current_mesh, rendering_params }; // I think we could also work with a Mat face_instance in this function instead of a Mesh, but it would convolute the code more (i.e. more complicated to access vertices).
-};
+    std::vector<std::vector<float>> all_blendshape_coefficients = {blendshape_coefficients};
+    std::vector<std::vector<cv::Vec2f>> all_fitted_image_points = {fitted_image_points};
+    //all_blendshape_coefficients.push_back(blendshape_coefficients);
+    std::pair<std::vector<core::Mesh>, std::vector<fitting::RenderingParameters>>  all_meshs_and_params = fit_shape_and_pose_multi( morphable_model, blendshapes, { landmarks }, landmark_mapper, { image_width }, { image_height }, edge_topology, contour_landmarks, model_contour, num_iterations, num_shape_coefficients_to_fit, lambda, initial_rendering_params, pca_shape_coefficients, all_blendshape_coefficients, all_fitted_image_points);
+    //std::pair<core::Mesh, fitting::RenderingParameters> mesh_and_param = std::make_pair(all_meshs_and_params.first[0], all_meshs_and_params.second[0]);
+    return {all_meshs_and_params.first[0], all_meshs_and_params.second[0] };
+}
 
 /**
  * @brief Fit the pose (camera), shape model, and expression blendshapes to landmarks,
@@ -405,6 +464,11 @@ inline std::pair<core::Mesh, fitting::RenderingParameters> fit_shape_and_pose(co
 	std::vector<cv::Vec2f> fitted_image_points;
 	return fit_shape_and_pose(morphable_model, blendshapes, landmarks, landmark_mapper, image_width, image_height, edge_topology, contour_landmarks, model_contour, num_iterations, num_shape_coefficients_to_fit, lambda, boost::none, pca_coeffs, blendshape_coeffs, fitted_image_points);
 };
+
+
+	
+	
+
 	} /* namespace fitting */
 } /* namespace eos */
 
