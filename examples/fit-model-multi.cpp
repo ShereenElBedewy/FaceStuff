@@ -139,7 +139,8 @@ void draw_wireframe(cv::Mat image, const core::Mesh& mesh, glm::mat4x4 modelview
  */
 int main(int argc, char *argv[])
 {
-	fs::path modelfile, isomapfile, imagefile, landmarksfile, mappingsfile, contourfile, edgetopologyfile, blendshapesfile, outputfile;
+    fs::path modelfile, isomapfile, mappingsfile, contourfile, edgetopologyfile, blendshapesfile, outputfilebase;
+    vector<fs::path> imagefiles, landmarksfiles;
 	try {
 		po::options_description desc("Allowed options");
 		desc.add_options()
@@ -147,11 +148,12 @@ int main(int argc, char *argv[])
 				"display the help message")
 			("model,m", po::value<fs::path>(&modelfile)->required()->default_value("../share/sfm_shape_3448.bin"),
 				"a Morphable Model stored as cereal BinaryArchive")
-			("image,i", po::value<fs::path>(&imagefile)->required()->default_value("data/image_0010.png"),
+            //("image,i", po::value<vector<fs::path>>(&imagefiles)->required()->default_value("data/image_0010.png"),
+            ("image,i", po::value<vector<fs::path>>(&imagefiles)->multitoken(),
 				"an input image")
-			("landmarks,l", po::value<fs::path>(&landmarksfile)->required()->default_value("data/image_0010.pts"),
+            ("landmarks,l", po::value<vector<fs::path>>(&landmarksfiles)->multitoken(),
 				"2D landmarks for the image, in ibug .pts format")
-			("mapping,p", po::value<fs::path>(&mappingsfile)->required()->default_value("../share/ibug_to_sfm.txt"),
+            ("mapping,p", po::value<fs::path>(&mappingsfile)->required()->default_value("../share/ibug_to_sfm.txt"),
 				"landmark identifier to model vertex number mapping")
 			("model-contour,c", po::value<fs::path>(&contourfile)->required()->default_value("../share/model_contours.json"),
 				"file with model contour indices")
@@ -159,7 +161,7 @@ int main(int argc, char *argv[])
 				"file with model's precomputed edge topology")
 			("blendshapes,b", po::value<fs::path>(&blendshapesfile)->required()->default_value("../share/expression_blendshapes_3448.bin"),
 				"file with blendshapes")
-			("output,o", po::value<fs::path>(&outputfile)->required()->default_value("out"),
+            ("output,o", po::value<fs::path>(&outputfilebase)->required()->default_value("out"),
 				"basename for the output rendering and obj files")
 			;
 		po::variables_map vm;
@@ -174,14 +176,28 @@ int main(int argc, char *argv[])
 	catch (const po::error& e) {
 		cout << "Error while parsing command-line arguments: " << e.what() << endl;
 		cout << "Use --help to display a list of options." << endl;
-		return EXIT_FAILURE;
+		return EXIT_SUCCESS;
 	}
 
+    if (landmarksfiles.size() != imagefiles.size()) {
+        cout << "Number of landmarksfiles not equal to number of images given: "<<landmarksfiles.size() <<"!=" <<imagefiles.size()<< endl;
+        return EXIT_SUCCESS;
+    }
+
+    if (landmarksfiles.empty()) {
+        cout << "Please give at least 1 image and landmarkfile" << endl;
+        return EXIT_SUCCESS;
+    }
 	// Load the image, landmarks, LandmarkMapper and the Morphable Model:
-	Mat image = cv::imread(imagefile.string());
-	LandmarkCollection<cv::Vec2f> landmarks;
+    vector<Mat> images;
+    for (auto& imagefile : imagefiles){
+        images.push_back(cv::imread(imagefile.string()));
+    }
+    vector<LandmarkCollection<cv::Vec2f>> landmarkss;
 	try {
-		landmarks = read_pts_landmarks(landmarksfile.string());
+        for (auto& landmarksfile : landmarksfiles){
+            landmarkss.push_back(read_pts_landmarks(landmarksfile.string()));
+        }
 	}
 	catch (const std::runtime_error& e) {
 		cout << "Error reading the landmarks: " << e.what() << endl;
@@ -209,38 +225,54 @@ int main(int argc, char *argv[])
 	morphablemodel::EdgeTopology edge_topology = morphablemodel::load_edge_topology(edgetopologyfile.string());
 
 	// Draw the loaded landmarks:
-	Mat outimg = image.clone();
-	for (auto&& lm : landmarks) {
-		cv::rectangle(outimg, cv::Point2f(lm.coordinates[0] - 2.0f, lm.coordinates[1] - 2.0f), cv::Point2f(lm.coordinates[0] + 2.0f, lm.coordinates[1] + 2.0f), { 255, 0, 0 });
-	}
+    vector<Mat> outimgs;
+    for (unsigned i =0; i <images.size(); ++i) {
+        Mat outimg = images[i].clone();
+        for (auto&& lm : landmarkss[i]) {
+            cv::rectangle(outimg, cv::Point2f(lm.coordinates[0] - 2.0f, lm.coordinates[1] - 2.0f), cv::Point2f(lm.coordinates[0] + 2.0f, lm.coordinates[1] + 2.0f), { 255, 0, 0 });
+        }
+        outimgs.push_back(outimg);
+    }
 
 	// Fit the model, get back a mesh and the pose:
-	core::Mesh mesh;
-	fitting::RenderingParameters rendering_params;
-	std::tie(mesh, rendering_params) = fitting::fit_shape_and_pose(morphable_model, blendshapes, landmarks, landmark_mapper, image.cols, image.rows, edge_topology, ibug_contour, model_contour, 50, boost::none, 30.0f);
+    vector<core::Mesh> meshs;
+    vector<fitting::RenderingParameters> rendering_paramss;
+    vector<int> image_widths;
+    vector<int> image_heights;
+    for (auto& image : images) {
+        image_widths.push_back(image.cols);
+        image_heights.push_back(image.rows);
+    }
+    std::tie(meshs, rendering_paramss) = fitting::fit_shape_and_pose_multi(morphable_model, blendshapes, landmarkss, landmark_mapper, image_widths, image_heights, edge_topology, ibug_contour, model_contour, 50, boost::none, 30.0f);
 
-	// The 3D head pose can be recovered as follows:
-	float yaw_angle = glm::degrees(glm::yaw(rendering_params.get_rotation()));
-	// and similarly for pitch and roll.
+    for (unsigned i =0; i <images.size(); ++i) {
 
-	// Extract the texture from the image using given mesh and camera parameters:
-	Mat affine_from_ortho = fitting::get_3x4_affine_camera_matrix(rendering_params, image.cols, image.rows);
-	Mat isomap = render::extract_texture(mesh, affine_from_ortho, image);
+        // The 3D head pose can be recovered as follows:
+        float yaw_angle = glm::degrees(glm::yaw(rendering_paramss[i].get_rotation()));
+        // and similarly for pitch and roll.
 
-	// Draw the fitted mesh as wireframe, and save the image:
-	draw_wireframe(outimg, mesh, rendering_params.get_modelview(), rendering_params.get_projection(), fitting::get_opencv_viewport(image.cols, image.rows));
-	outputfile += fs::path(".png");
-	cv::imwrite(outputfile.string(), outimg);
+        // Extract the texture from the image using given mesh and camera parameters:
+        Mat affine_from_ortho = fitting::get_3x4_affine_camera_matrix(rendering_paramss[i], images[i].cols, images[i].rows);
+        Mat isomap = render::extract_texture(meshs[i], affine_from_ortho, images[i]);
 
-	// Save the mesh as textured obj:
-	outputfile.replace_extension(".obj");
-	core::write_textured_obj(mesh, outputfile.string());
+        // Draw the fitted mesh as wireframe, and save the image:
+        draw_wireframe(outimgs[i], meshs[i], rendering_paramss[i].get_modelview(), rendering_paramss[i].get_projection(), fitting::get_opencv_viewport(images[i].cols, images[i].rows));
+        fs::path outputfile = outputfilebase;
+        outputfile += fs::path(imagefiles[i].stem());
+        outputfile += fs::path(".png");
+        cv::imwrite(outputfile.string(), outimgs[i]);
 
-	// And save the isomap:
-	outputfile.replace_extension(".isomap.png");
-	cv::imwrite(outputfile.string(), isomap);
+        // Save the mesh as textured obj:
+        outputfile.replace_extension(".obj");
+        core::write_textured_obj(meshs[i], outputfile.string());
 
-	cout << "Finished fitting and wrote result mesh and isomap to files with basename " << outputfile.stem().stem() << "." << endl;
+        // And save the isomap:
+        outputfile.replace_extension(".isomap.png");
+        cv::imwrite(outputfile.string(), isomap);
+
+    }
+
+    cout << "Finished fitting and wrote result mesh and isomap to files with basename " << outputfilebase << "." << endl;
 
 	return EXIT_SUCCESS;
 }

@@ -51,7 +51,7 @@ namespace eos {
  * @param[in] landmarks 2D landmarks from an image to fit the model to.
  * @param[in] vertex_ids The vertex ids in the model that correspond to the 2D points.
  * @param[in] base_face The base or reference face from where the fitting is started. Usually this would be the models mean face, which is what will be used if the parameter is not explicitly specified.
- * @param[in] lambda The regularisation parameter (weight of the prior towards the mean).
+ * @param[in] lambda The regularisation parameter (weight of the prior towards the mean). Gets normalized by the number of images given.
  * @param[in] num_coefficients_to_fit How many shape-coefficients to fit (all others will stay 0). Should be bigger than zero, or boost::none to fit all coefficients.
  * @param[in] detector_standard_deviation The standard deviation of the 2D landmarks given (e.g. of the detector used), in pixels.
  * @param[in] model_standard_deviation The standard deviation of the 3D vertex points in the 3D model, projected to 2D (so the value is in pixels).
@@ -65,6 +65,9 @@ inline std::vector<float> fit_shape_to_landmarks_linear_multi(morphablemodel::Mo
 	int num_coeffs_to_fit = num_coefficients_to_fit.get_value_or(morphable_model.get_shape_model().get_num_principal_components());
 	int num_images = affine_camera_matrix.size();
 
+    // the regularisation has to be adjusted when more than one image is given
+    lambda *= num_images;
+
 	int total_num_landmarks_dimension = 0;
 	for (auto&& l : landmarks) {
 		total_num_landmarks_dimension += l.size();
@@ -77,9 +80,8 @@ inline std::vector<float> fit_shape_to_landmarks_linear_multi(morphablemodel::Mo
 	// Form a block diagonal matrix $P \in R^{3N\times 4N}$ in which the camera matrix C (P_Affine, affine_camera_matrix) is placed on the diagonal:
 	Mat P = Mat::zeros(3 * total_num_landmarks_dimension, 4 * total_num_landmarks_dimension, CV_32FC1);
 	int P_index = 0;
-	Mat Sigma = Mat::zeros(3 * total_num_landmarks_dimension, 3 * total_num_landmarks_dimension, CV_32FC1);
-	int Sigma_index = 0; // this runs the same as P_index
-	Mat Omega;
+    Mat Omega = Mat::zeros(3 * total_num_landmarks_dimension, 3 * total_num_landmarks_dimension, CV_32FC1);
+    int Omega_index = 0; // this runs the same as P_index
 	// The landmarks in matrix notation (in homogeneous coordinates), $3N\times 1$
 	Mat y = Mat::ones(3 * total_num_landmarks_dimension, 1, CV_32FC1);
 	int y_index = 0; // also runs the same as P_index. Should rename to "running_index"?
@@ -124,11 +126,10 @@ inline std::vector<float> fit_shape_to_landmarks_linear_multi(morphablemodel::Mo
 		float sigma_squared_2D = std::pow(detector_standard_deviation.get_value_or(std::sqrt(3.0f)), 2) + std::pow(model_standard_deviation.get_value_or(0.0f), 2);
 		//Mat Sigma = Mat::zeros(3 * num_landmarks, 3 * num_landmarks, CV_32FC1);
 		for (int i = 0; i < 3 * num_landmarks; ++i) {
-			Sigma.at<float>(Sigma_index, Sigma_index) = 1.0f / std::sqrt(sigma_squared_2D); // the higher the sigma_squared_2D, the smaller the diagonal entries of Sigma will be
-			++Sigma_index;
+            // Sigma(i, i) = sqrt(sigma_squared_2D), but then Omega is Sigma.t() * Sigma (squares the diagonal) - so we just assign 1/sigma_squared_2D to Omega here:
+            Omega.at<float>(Omega_index, Omega_index) = 1.0f / sigma_squared_2D; // the higher the sigma_squared_2D, the smaller the diagonal entries of Sigma will be
+            ++Omega_index;
 		}
-		//Mat Omega = Sigma.t() * Sigma; // just squares the diagonal
-		// => moved outside the loop
 		
 		// The landmarks in matrix notation (in homogeneous coordinates), $3N\times 1$
 		//Mat y = Mat::ones(3 * num_landmarks, 1, CV_32FC1);
@@ -151,7 +152,6 @@ inline std::vector<float> fit_shape_to_landmarks_linear_multi(morphablemodel::Mo
 			// note: now that a Vec4f is returned, we could use copyTo?
 		}
 	}
-	Omega = Sigma.t() * Sigma; // moved outside the loop. But can do even more efficiently anyway.
 
 	// Bring into standard regularised quadratic form with diagonal distance matrix Omega
 	Mat A = P * V_hat_h; // camera matrix times the basis
@@ -214,7 +214,6 @@ inline std::vector<float> fit_shape_to_landmarks_linear(const morphablemodel::Mo
 {
 	return fit_shape_to_landmarks_linear_multi(morphable_model, { affine_camera_matrix }, { landmarks }, { vertex_ids }, { base_face }, lambda, num_coefficients_to_fit, detector_standard_deviation, model_standard_deviation );
 }
-
 
 
 	} /* namespace fitting */
