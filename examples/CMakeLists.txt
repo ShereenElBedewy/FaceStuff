@@ -30,6 +30,11 @@ add_executable(fit-model fit-model.cpp)
 target_link_libraries(fit-model eos ${OpenCV_LIBS} ${Boost_LIBRARIES})
 target_link_libraries(fit-model "$<$<CXX_COMPILER_ID:GNU>:-pthread>$<$<CXX_COMPILER_ID:Clang>:-pthreads>")
 
+# Model fitting example that fits orthographic camera, shape, blendshapes, and contours to multiple images:
+add_executable(fit-model-multi fit-model-multi.cpp)
+target_link_libraries(fit-model-multi eos ${OpenCV_LIBS} ${Boost_LIBRARIES})
+target_link_libraries(fit-model-multi "$<$<CXX_COMPILER_ID:GNU>:-pthread>$<$<CXX_COMPILER_ID:Clang>:-pthreads>")
+
 # Generate random samples from the model:
 add_executable(generate-obj generate-obj.cpp)
 target_link_libraries(generate-obj eos ${OpenCV_LIBS} ${Boost_LIBRARIES})
@@ -37,6 +42,7 @@ target_link_libraries(generate-obj eos ${OpenCV_LIBS} ${Boost_LIBRARIES})
 # Install these targets:
 install(TARGETS fit-model-simple DESTINATION bin)
 install(TARGETS fit-model DESTINATION bin)
+install(TARGETS fit-model-multi DESTINATION bin)
 install(TARGETS generate-obj DESTINATION bin)
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/data DESTINATION bin)
 

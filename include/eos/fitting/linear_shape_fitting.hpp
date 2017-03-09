@@ -51,72 +51,108 @@ namespace eos {
  * @param[in] landmarks 2D landmarks from an image to fit the model to.
  * @param[in] vertex_ids The vertex ids in the model that correspond to the 2D points.
  * @param[in] base_face The base or reference face from where the fitting is started. Usually this would be the models mean face, which is what will be used if the parameter is not explicitly specified.
- * @param[in] lambda The regularisation parameter (weight of the prior towards the mean).
+ * @param[in] lambda The regularisation parameter (weight of the prior towards the mean). Gets normalized by the number of images given.
  * @param[in] num_coefficients_to_fit How many shape-coefficients to fit (all others will stay 0). Should be bigger than zero, or boost::none to fit all coefficients.
  * @param[in] detector_standard_deviation The standard deviation of the 2D landmarks given (e.g. of the detector used), in pixels.
  * @param[in] model_standard_deviation The standard deviation of the 3D vertex points in the 3D model, projected to 2D (so the value is in pixels).
  * @return The estimated shape-coefficients (alphas).
  */
-inline std::vector<float> fit_shape_to_landmarks_linear(const morphablemodel::MorphableModel& morphable_model, cv::Mat affine_camera_matrix, const std::vector<cv::Vec2f>& landmarks, const std::vector<int>& vertex_ids, Eigen::VectorXf base_face=Eigen::VectorXf(), float lambda=3.0f, boost::optional<int> num_coefficients_to_fit=boost::optional<int>(), boost::optional<float> detector_standard_deviation=boost::optional<float>(), boost::optional<float> model_standard_deviation=boost::optional<float>())
+inline std::vector<float> fit_shape_to_landmarks_linear_multi(morphablemodel::MorphableModel morphable_model, std::vector<cv::Mat> affine_camera_matrix, std::vector<std::vector<cv::Vec2f>>& landmarks, std::vector<std::vector<int>>& vertex_ids, std::vector<Eigen::VectorXf> base_face=std::vector<Eigen::VectorXf>(), float lambda=3.0f, boost::optional<int> num_coefficients_to_fit=boost::optional<int>(), boost::optional<float> detector_standard_deviation=boost::optional<float>(), boost::optional<float> model_standard_deviation=boost::optional<float>())
 {
 	using cv::Mat;
-	assert(landmarks.size() == vertex_ids.size());
+	assert(affine_camera_matrix.size() == landmarks.size() && landmarks.size() == vertex_ids.size()); // same number of instances (i.e. images/frames) for each of them
 
 	int num_coeffs_to_fit = num_coefficients_to_fit.get_value_or(morphable_model.get_shape_model().get_num_principal_components());
-	int num_landmarks = static_cast<int>(landmarks.size());
+	int num_images = affine_camera_matrix.size();
 
-	if (base_face.size() == 0)
-	{
-		base_face = morphable_model.get_shape_model().get_mean();
+    // the regularisation has to be adjusted when more than one image is given
+    lambda *= num_images;
+
+	int total_num_landmarks_dimension = 0;
+	for (auto&& l : landmarks) {
+		total_num_landmarks_dimension += l.size();
 	}
-
 	// $\hat{V} \in R^{3N\times m-1}$, subselect the rows of the eigenvector matrix $V$ associated with the $N$ feature points
 	// And we insert a row of zeros after every third row, resulting in matrix $\hat{V}_h \in R^{4N\times m-1}$:
-	Mat V_hat_h = Mat::zeros(4 * num_landmarks, num_coeffs_to_fit, CV_32FC1);
-	int row_index = 0;
-	for (int i = 0; i < num_landmarks; ++i) {
-		Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> basis_rows_ = morphable_model.get_shape_model().get_rescaled_pca_basis_at_point(vertex_ids[i]); // In the paper, the orthonormal basis might be used? I'm not sure, check it. It's even a mess in the paper. PH 26.5.2014: I think the rescaled basis is fine/better.
-		// Above converts to a RowMajor matrix on return - for now, since the core algorithm still uses cv::Mat (and OpenCV stores data in row-major memory order).
-		Mat basis_rows = Mat(basis_rows_.rows(), basis_rows_.cols(), CV_32FC1, basis_rows_.data());
-		//basisRows.copyTo(V_hat_h.rowRange(rowIndex, rowIndex + 3));
-		basis_rows.colRange(0, num_coeffs_to_fit).copyTo(V_hat_h.rowRange(row_index, row_index + 3));
-		row_index += 4; // replace 3 rows and skip the 4th one, it has all zeros
-	}
+	Mat V_hat_h = Mat::zeros(4 * total_num_landmarks_dimension, num_coeffs_to_fit, CV_32FC1);
+	int V_hat_h_row_index = 0;
 	// Form a block diagonal matrix $P \in R^{3N\times 4N}$ in which the camera matrix C (P_Affine, affine_camera_matrix) is placed on the diagonal:
-	Mat P = Mat::zeros(3 * num_landmarks, 4 * num_landmarks, CV_32FC1);
-	for (int i = 0; i < num_landmarks; ++i) {
-		Mat submatrix_to_replace = P.colRange(4 * i, (4 * i) + 4).rowRange(3 * i, (3 * i) + 3);
-		affine_camera_matrix.copyTo(submatrix_to_replace);
-	}
-	// The variances: Add the 2D and 3D standard deviations.
-	// If the user doesn't provide them, we choose the following:
-	// 2D (detector) standard deviation: In pixel, we follow [1] and choose sqrt(3) as the default value.
-	// 3D (model) variance: 0.0f. It only makes sense to set it to something when we have a different variance for different vertices.
-	// The 3D variance has to be projected to 2D (for details, see paper [1]) so the units do match up.
-	float sigma_squared_2D = std::pow(detector_standard_deviation.get_value_or(std::sqrt(3.0f)), 2) + std::pow(model_standard_deviation.get_value_or(0.0f), 2);
-	Mat Omega = Mat::zeros(3 * num_landmarks, 3 * num_landmarks, CV_32FC1);
-	for (int i = 0; i < 3 * num_landmarks; ++i) {
-		// Sigma(i, i) = sqrt(sigma_squared_2D), but then Omega is Sigma.t() * Sigma (squares the diagonal) - so we just assign 1/sigma_squared_2D to Omega here:
-		Omega.at<float>(i, i) = 1.0f / sigma_squared_2D; // the higher the sigma_squared_2D, the smaller the diagonal entries of Sigma will be
-	}
+	Mat P = Mat::zeros(3 * total_num_landmarks_dimension, 4 * total_num_landmarks_dimension, CV_32FC1);
+	int P_index = 0;
+    Mat Omega = Mat::zeros(3 * total_num_landmarks_dimension, 3 * total_num_landmarks_dimension, CV_32FC1);
+    int Omega_index = 0; // this runs the same as P_index
 	// The landmarks in matrix notation (in homogeneous coordinates), $3N\times 1$
-	Mat y = Mat::ones(3 * num_landmarks, 1, CV_32FC1);
-	for (int i = 0; i < num_landmarks; ++i) {
-		y.at<float>(3 * i, 0) = landmarks[i][0];
-		y.at<float>((3 * i) + 1, 0) = landmarks[i][1];
-		//y.at<float>((3 * i) + 2, 0) = 1; // already 1, stays (homogeneous coordinate)
-	}
+	Mat y = Mat::ones(3 * total_num_landmarks_dimension, 1, CV_32FC1);
+	int y_index = 0; // also runs the same as P_index. Should rename to "running_index"?
 	// The mean, with an added homogeneous coordinate (x_1, y_1, z_1, 1, x_2, ...)^t
-	Mat v_bar = Mat::ones(4 * num_landmarks, 1, CV_32FC1);
-	for (int i = 0; i < num_landmarks; ++i) {
-		//cv::Vec4f model_mean = morphable_model.get_shape_model().get_mean_at_point(vertex_ids[i]);
-		cv::Vec4f model_mean(base_face(vertex_ids[i] * 3), base_face(vertex_ids[i] * 3 + 1), base_face(vertex_ids[i] * 3 + 2), 1.0f);
-		v_bar.at<float>(4 * i, 0) = model_mean[0];
-		v_bar.at<float>((4 * i) + 1, 0) = model_mean[1];
-		v_bar.at<float>((4 * i) + 2, 0) = model_mean[2];
-		//v_bar.at<float>((4 * i) + 3, 0) = 1; // already 1, stays (homogeneous coordinate)
-		// note: now that a Vec4f is returned, we could use copyTo?
-	}
+	Mat v_bar = Mat::ones(4 * total_num_landmarks_dimension, 1, CV_32FC1);
+	int v_bar_index = 0; // also runs the same as P_index. But be careful, if I change it to be only 1 variable, only increment it once! :-)
+						 // Well I think that would make it a bit messy since we need to increment inside the for (landmarks...) loop. Try to refactor some other way.
+
+    for (int k = 0; k < num_images; ++k)
+    {
+        // For each image we have, set up the equations and add it to the matrices:
+        assert(landmarks[k].size() == vertex_ids[k].size()); // has to be valid for each img
+
+        int num_landmarks = static_cast<int>(landmarks[k].size());
+
+        if (base_face[k].size()==0)
+        {
+            base_face[k] = morphable_model.get_shape_model().get_mean();
+        }
+
+        // $\hat{V} \in R^{3N\times m-1}$, subselect the rows of the eigenvector matrix $V$ associated with the $N$ feature points
+        // And we insert a row of zeros after every third row, resulting in matrix $\hat{V}_h \in R^{4N\times m-1}$:
+        //Mat V_hat_h = Mat::zeros(4 * num_landmarks, num_coeffs_to_fit, CV_32FC1);
+        for (int i = 0; i < num_landmarks; ++i) {
+            Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> basis_rows_ = morphable_model.get_shape_model().get_rescaled_pca_basis_at_point(vertex_ids[k][i]); // In the paper, the orthonormal basis might be used? I'm not sure, check it. It's even a mess in the paper. PH 26.5.2014: I think the rescaled basis is fine/better.
+            // Above converts to a RowMajor matrix on return - for now, since the core algorithm still uses cv::Mat (and OpenCV stores data in row-major memory order).
+            Mat basis_rows = Mat(basis_rows_.rows(), basis_rows_.cols(), CV_32FC1, basis_rows_.data());
+            //basisRows.copyTo(V_hat_h.rowRange(rowIndex, rowIndex + 3));
+            basis_rows.colRange(0, num_coeffs_to_fit).copyTo(V_hat_h.rowRange(V_hat_h_row_index, V_hat_h_row_index + 3));
+            V_hat_h_row_index += 4; // replace 3 rows and skip the 4th one, it has all zeros
+        }
+        // Form a block diagonal matrix $P \in R^{3N\times 4N}$ in which the camera matrix C (P_Affine, affine_camera_matrix) is placed on the diagonal:
+        //Mat P = Mat::zeros(3 * num_landmarks, 4 * num_landmarks, CV_32FC1);
+        for (int i = 0; i < num_landmarks; ++i) {
+            Mat submatrix_to_replace = P.colRange(4 * P_index, (4 * P_index) + 4).rowRange(3 * P_index, (3 * P_index) + 3);
+            affine_camera_matrix[k].copyTo(submatrix_to_replace);
+            ++P_index;
+        }
+        // The variances: Add the 2D and 3D standard deviations.
+        // If the user doesn't provide them, we choose the following:
+        // 2D (detector) standard deviation: In pixel, we follow [1] and choose sqrt(3) as the default value.
+        // 3D (model) variance: 0.0f. It only makes sense to set it to something when we have a different variance for different vertices.
+        // The 3D variance has to be projected to 2D (for details, see paper [1]) so the units do match up.
+        float sigma_squared_2D = std::pow(detector_standard_deviation.get_value_or(std::sqrt(3.0f)), 2) + std::pow(model_standard_deviation.get_value_or(0.0f), 2);
+        //Mat Sigma = Mat::zeros(3 * num_landmarks, 3 * num_landmarks, CV_32FC1);
+        for (int i = 0; i < 3 * num_landmarks; ++i) {
+            // Sigma(i, i) = sqrt(sigma_squared_2D), but then Omega is Sigma.t() * Sigma (squares the diagonal) - so we just assign 1/sigma_squared_2D to Omega here:
+            Omega.at<float>(Omega_index, Omega_index) = 1.0f / sigma_squared_2D; // the higher the sigma_squared_2D, the smaller the diagonal entries of Sigma will be
+            ++Omega_index;
+        }
+
+        // The landmarks in matrix notation (in homogeneous coordinates), $3N\times 1$
+        //Mat y = Mat::ones(3 * num_landmarks, 1, CV_32FC1);
+        for (int i = 0; i < num_landmarks; ++i) {
+            y.at<float>(3 * y_index, 0) = landmarks[k][i][0];
+            y.at<float>((3 * y_index) + 1, 0) = landmarks[k][i][1];
+            //y.at<float>((3 * i) + 2, 0) = 1; // already 1, stays (homogeneous coordinate)
+            ++y_index;
+        }
+        // The mean, with an added homogeneous coordinate (x_1, y_1, z_1, 1, x_2, ...)^t
+        //Mat v_bar = Mat::ones(4 * num_landmarks, 1, CV_32FC1);
+        for (int i = 0; i < num_landmarks; ++i) {
+            //cv::Vec4f model_mean = morphable_model.get_shape_model().get_mean_at_point(vertex_ids[i]);
+            cv::Vec4f model_mean(base_face[k](vertex_ids[k][i] * 3), base_face[k](vertex_ids[k][i] * 3 + 1), base_face[k](vertex_ids[k][i] * 3 + 2), 1.0f);
+            v_bar.at<float>(4 * v_bar_index, 0) = model_mean[0];
+            v_bar.at<float>((4 * v_bar_index) + 1, 0) = model_mean[1];
+            v_bar.at<float>((4 * v_bar_index) + 2, 0) = model_mean[2];
+            //v_bar.at<float>((4 * i) + 3, 0) = 1; // already 1, stays (homogeneous coordinate)
+            ++v_bar_index;
+            // note: now that a Vec4f is returned, we could use copyTo?
+        }
+    }
 
 	// Bring into standard regularised quadratic form with diagonal distance matrix Omega
 	Mat A = P * V_hat_h; // camera matrix times the basis
@@ -144,6 +180,35 @@ inline std::vector<float> fit_shape_to_landmarks_linear(const morphablemodel::Mo
 
 	return std::vector<float>(c_s);
 };
+
+/**
+ * Fits the shape of a Morphable Model to given 2D landmarks (i.e. estimates the maximum likelihood solution of the shape coefficients) as proposed in [1].
+ * It's a linear, closed-form solution fitting of the shape, with regularisation (prior towards the mean).
+ *
+ * [1] O. Aldrian & W. Smith, Inverse Rendering of Faces with a 3D Morphable Model, PAMI 2013.
+ *
+ * Note: Using less than the maximum number of coefficients to fit is not thoroughly tested yet and may contain an error.
+ * Note: Returns coefficients following standard normal distribution (i.e. all have similar magnitude). Why? Because we fit using the normalised basis?
+ * Note: The standard deviations given should be a vector, i.e. different for each landmark. This is not implemented yet.
+ *
+ * @param[in] morphable_model The Morphable Model whose shape (coefficients) are estimated.
+ * @param[in] affine_camera_matrix A 3x4 affine camera matrix from model to screen-space (should probably be of type CV_32FC1 as all our calculations are done with float).
+ * @param[in] landmarks 2D landmarks from an image to fit the model to.
+ * @param[in] vertex_ids The vertex ids in the model that correspond to the 2D points.
+ * @param[in] base_face The base or reference face from where the fitting is started. Usually this would be the models mean face, which is what will be used if the parameter is not explicitly specified.
+ * @param[in] lambda The regularisation parameter (weight of the prior towards the mean).
+ * @param[in] num_coefficients_to_fit How many shape-coefficients to fit (all others will stay 0). Should be bigger than zero, or boost::none to fit all coefficients.
+ * @param[in] detector_standard_deviation The standard deviation of the 2D landmarks given (e.g. of the detector used), in pixels.
+ * @param[in] model_standard_deviation The standard deviation of the 3D vertex points in the 3D model, projected to 2D (so the value is in pixels).
+ * @return The estimated shape-coefficients (alphas).
+ */
+inline std::vector<float> fit_shape_to_landmarks_linear(const morphablemodel::MorphableModel& morphable_model, cv::Mat affine_camera_matrix, std::vector<cv::Vec2f> landmarks, std::vector<int> vertex_ids, Eigen::VectorXf base_face=Eigen::VectorXf(), float lambda=3.0f, boost::optional<int> num_coefficients_to_fit=boost::optional<int>(), boost::optional<float> detector_standard_deviation=boost::optional<float>(), boost::optional<float> model_standard_deviation=boost::optional<float>())
+{
+    std::vector<std::vector<cv::Vec2f>> all_landmarks = {landmarks};
+    std::vector<std::vector<int>> all_vertex_ids = {vertex_ids};
+    return fit_shape_to_landmarks_linear_multi(morphable_model, { affine_camera_matrix }, all_landmarks, all_vertex_ids, { base_face }, lambda, num_coefficients_to_fit, detector_standard_deviation, model_standard_deviation );
+}
+
 
 	} /* namespace fitting */
 } /* namespace eos */
