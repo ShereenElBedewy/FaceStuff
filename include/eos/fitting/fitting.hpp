@@ -389,9 +389,6 @@ inline std::pair<std::vector<core::Mesh>, std::vector<fitting::RenderingParamete
             mean_plus_blendshapes.push_back(current_mean_plus_blendshapes);
         }
         pca_shape_coefficients = fitting::fit_shape_to_landmarks_linear_multi(morphable_model, affine_from_orthos, image_points, vertex_indices, mean_plus_blendshapes, lambda, num_shape_coefficients_to_fit);
-        for (auto i: pca_shape_coefficients)
-          std::cout << i << ' ';
-        std::cout << std::endl;
 
         // Estimate the blendshape coefficients with the current PCA model estimate:
         current_pca_shape = morphable_model.get_shape_model().draw_sample(pca_shape_coefficients);
