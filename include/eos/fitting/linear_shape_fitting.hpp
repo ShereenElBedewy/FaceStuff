@@ -25,6 +25,7 @@
 #include "eos/morphablemodel/MorphableModel.hpp"
 
 #include "Eigen/QR"
+#include "Eigen/Sparse"
 
 #include "opencv2/core/core.hpp"
 
@@ -82,7 +83,8 @@ inline std::vector<float> fit_shape_to_landmarks_linear_multi(const morphablemod
     MatrixXf V_hat_h = MatrixXf::Zero(4 * total_num_landmarks_dimension, num_coeffs_to_fit);
 	int V_hat_h_row_index = 0;
 	// Form a block diagonal matrix $P \in R^{3N\times 4N}$ in which the camera matrix C (P_Affine, affine_camera_matrix) is placed on the diagonal:
-    MatrixXf P = MatrixXf::Zero(3 * total_num_landmarks_dimension, 4 * total_num_landmarks_dimension);
+    Eigen::SparseMatrix<float> P (3 * total_num_landmarks_dimension, 4 * total_num_landmarks_dimension);
+    std::vector<Eigen::Triplet<float>> P_coefficients; // list of non-zeros coefficients
 	int P_index = 0;
 	// The variances: Add the 2D and 3D standard deviations.
 	// If the user doesn't provide them, we choose the following:
@@ -120,13 +122,17 @@ inline std::vector<float> fit_shape_to_landmarks_linear_multi(const morphablemod
             V_hat_h.block(V_hat_h_row_index, 0, 3, V_hat_h.cols()) = basis_rows_.block(0, 0, basis_rows_.rows(), num_coeffs_to_fit);
             V_hat_h_row_index += 4; // replace 3 rows and skip the 4th one, it has all zeros
         }
+
         // Form a block diagonal matrix $P \in R^{3N\times 4N}$ in which the camera matrix C (P_Affine, affine_camera_matrix) is placed on the diagonal:
-        //Mat P = Mat::zeros(3 * num_landmarks, 4 * num_landmarks, CV_32FC1);
         for (int i = 0; i < num_landmarks; ++i) {
-            using RowMajorMatrixXf = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-            P.block(3 * P_index, 4 * P_index, 3, 4) = Eigen::Map<RowMajorMatrixXf>(affine_camera_matrix[k].ptr<float>(), affine_camera_matrix[k].rows, affine_camera_matrix[k].cols);
+            for (int x = 0; x < affine_camera_matrix[k].rows; ++x){
+                for (int y = 0; y < affine_camera_matrix[k].cols; ++y){
+                    P_coefficients.push_back(Eigen::Triplet<float>(3 * P_index + x, 4 * P_index + y, affine_camera_matrix[k].at<float>(x,y)));
+                }
+            }
             ++P_index;
         }
+
 
         // The landmarks in matrix notation (in homogeneous coordinates), $3N\times 1$
         //Mat y = Mat::ones(3 * num_landmarks, 1, CV_32FC1);
@@ -147,6 +153,9 @@ inline std::vector<float> fit_shape_to_landmarks_linear_multi(const morphablemod
         }
     }
 
+    // fill P with coefficients
+    P.setFromTriplets(P_coefficients.begin(), P_coefficients.end());
+
 	// Bring into standard regularised quadratic form with diagonal distance matrix Omega:
 	const MatrixXf A = P * V_hat_h; // camera matrix times the basis
 	const MatrixXf b = P * v_bar - y; // camera matrix times the mean, minus the landmarks
@@ -156,7 +165,7 @@ inline std::vector<float> fit_shape_to_landmarks_linear_multi(const morphablemod
 	// We get coefficients ~ N(0, 1), because we're fitting with the rescaled basis. The coefficients are not multiplied with their eigenvalues.
 	const VectorXf c_s = AtOmegaAReg.colPivHouseholderQr().solve(rhs);
 
-	return std::vector<float>(c_s.data(), c_s.data() + c_s.size());
+    return std::vector<float>(c_s.data(), c_s.data() + c_s.size());
 };
 
 
