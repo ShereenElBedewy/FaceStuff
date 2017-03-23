@@ -498,8 +498,14 @@ inline std::pair<core::Mesh, fitting::RenderingParameters> fit_shape_and_pose(co
     {
         all_blendshape_coefficients = {blendshape_coefficients};
     }
-    std::vector<std::vector<cv::Vec2f>> all_fitted_image_points = {fitted_image_points};
+    std::vector<std::vector<cv::Vec2f>> all_fitted_image_points;
+    if (!fitted_image_points.empty())
+    {
+        all_fitted_image_points = {fitted_image_points};
+    }
     std::pair<std::vector<core::Mesh>, std::vector<fitting::RenderingParameters>>  all_meshs_and_params = fit_shape_and_pose_multi( morphable_model, blendshapes, { landmarks }, landmark_mapper, { image_width }, { image_height }, edge_topology, contour_landmarks, model_contour, num_iterations, num_shape_coefficients_to_fit, lambda, initial_rendering_params, pca_shape_coefficients, all_blendshape_coefficients, all_fitted_image_points);
+    blendshape_coefficients = all_blendshape_coefficients[0];
+    fitted_image_points = all_fitted_image_points[0];
 
     return {all_meshs_and_params.first[0], all_meshs_and_params.second[0] };
 }
