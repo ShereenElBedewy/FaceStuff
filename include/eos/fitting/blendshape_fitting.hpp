@@ -177,7 +177,10 @@ inline std::vector<float> fit_blendshapes_to_landmarks_nnls(const std::vector<eo
 	const MatrixXf b = P * v_bar - y; // camera matrix times the mean, minus the landmarks
 	// Solve using NNLS:
 	VectorXf coefficients;
-	bool non_singular = Eigen::NNLS<MatrixXf>::solve(A, -b, coefficients);
+
+    Eigen::NNLS<MatrixXf> nnls(A, 100); //it normaly converges within <10 iterations
+    bool non_singular = nnls.solve(-b);
+    coefficients.noalias() = nnls.x();
 
 	return std::vector<float>(coefficients.data(), coefficients.data() + coefficients.size());
 };
